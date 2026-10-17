@@ -1088,7 +1088,8 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   duckdb::shared_ptr<SiriusContext> context_;
 };
 
-/// \brief Read the per-session `enable_duckdb_fallback` setting (default true).
+/// \brief Read the per-session `enable_duckdb_fallback` setting (default false in the UVM
+/// experiment).
 ///
 /// Gates both plan-time and runtime fallback from GPU to DuckDB CPU. Set per
 /// connection via `SET enable_duckdb_fallback = ...`.

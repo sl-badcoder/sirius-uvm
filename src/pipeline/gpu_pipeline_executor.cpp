@@ -42,7 +42,6 @@
 #include <exception>
 #include <format>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <utility>
 namespace sirius {
@@ -53,14 +52,13 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
-  sirius::parallel::downgrade_executor* downgrade_executor,
+  sirius::parallel::downgrade_executor* /* downgrade_executor */,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
   : sirius::parallel::itask_executor(
       lifecycle, config, std::move(telemetry_context), mem_space->get_device_id()),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
-    _memory_space(mem_space),
-    _downgrade_executor(downgrade_executor)
+    _memory_space(mem_space)
 {
 }
 
@@ -189,29 +187,6 @@ void gpu_pipeline_executor::process_task(
       .bytes_to_materialize = reservation_info.bytes_to_materialize_input,
       .manager_thread       = {.target = manager_thread_handle.id(), .data = {}},
     });
-    // Clamp the reservation request to what this memory space can actually
-    // grant (its reservation limit). The history-based estimate can balloon far
-    // past capacity — a small input that once drove a near-cap peak yields a
-    // huge peak/estimate ratio that extrapolates to multi-GiB estimates on a
-    // GiB-budget GPU. make_reservation() then returns only a partial reservation
-    // and the downgrade predicate below (which must reserve the *full*
-    // bytes_needs) can never succeed, so the task livelocks through the
-    // OOM-reschedule loop until the retry cap trips and the query fails. Capping
-    // at get_max_memory() keeps both the reservation and the downgrade target
-    // achievable; any per-batch overflow during execution is still handled by
-    // the OOM-reschedule + tiering path. (Telemetry above intentionally reports
-    // the pre-clamp estimate so the estimator can still be analyzed.)
-    if (auto const space_max = _memory_space->get_max_memory();
-        space_max > 0 && bytes_needs > space_max) {
-      SIRIUS_LOG_DEBUG(
-        "GPU Pipeline Executor: clamping reservation request {} -> {} bytes (space max) for "
-        "pipeline {} task {}",
-        bytes_needs,
-        space_max,
-        gpu_task->get_pipeline_id(),
-        gpu_task->get_task_id());
-      bytes_needs = space_max;
-    }
     SIRIUS_LOG_TRACE(
       "[GPU:{}] GPU Pipeline Executor: Acquiring memory reservation for pipeline {} of {} bytes "
       "for task {}. Memory available: {}, total reserved: {}, max: {}",
@@ -222,158 +197,21 @@ void gpu_pipeline_executor::process_task(
       _memory_space->get_available_memory(),
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
-    // Try without blocking first, purely so the blocking case can be reported.
-    // make_reservation() parks until the memory frees up, and a listener told
-    // only once it returns learns nothing it can act on -- by then the stall it
-    // would have exploited is over.  A reservation that succeeds outright is the
-    // common case and raises nothing.
-    auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
-    if (!reservation) {
-      if (_query_event_publisher) {
-        auto const* pipe               = gpu_task->get_pipeline();
-        auto const stalled_operator_id = pipe != nullptr
-                                           ? pipe->get_source_operator().first
-                                           : op::sirius_physical_operator::invalid_operator_id;
-        _query_event_publisher->publish_wait_for_memory_for_task(
-          make_query_id(
-            static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
-          stalled_operator_id,
-          _memory_space != nullptr ? _memory_space->get_device_id() : -1,
-          bytes_needs);
-      }
-      reservation = _memory_space->make_reservation(bytes_needs);
+    // UVM owns residency. Do not wait for a downgrade that this experiment
+    // deliberately forbids, or continue with an underfunded reservation.
+    std::unique_ptr<cucascade::memory::reservation> reservation;
+    if (bytes_needs <= _memory_space->get_max_memory()) {
+      reservation = _memory_space->make_reservation_or_null(bytes_needs);
     }
-    if (!reservation) {
-      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
-                       gpu_task->get_task_id());
-      if (auto handler = gpu_task->get_completion_handler()) {
-        handler->report_error(
-          "GPU Pipeline Executor: Failed to acquire memory reservation for task " +
-          std::to_string(gpu_task->get_task_id()));
-      }
+    if (!reservation || reservation->size() < bytes_needs) {
+      auto const message = std::format(
+        "UVM: logical GPU reservation budget exhausted for task {} (requested {} bytes). "
+        "Increase memory.gpu.usage_limit_bytes; application spilling is disabled.",
+        gpu_task->get_task_id(),
+        bytes_needs);
+      if (auto handler = gpu_task->get_completion_handler()) { handler->report_error(message); }
+      SIRIUS_LOG_ERROR("{}", message);
       return;
-    } else if (reservation->size() < bytes_needs && _downgrade_executor) {
-      size_t shortfall    = bytes_needs - reservation->size();
-      size_t partial_size = reservation->size();
-
-      gpu_task->telemetry_fsm().downgrading({
-        .shortfall_bytes = shortfall,
-        .partial_bytes   = partial_size,
-        .manager_thread  = {manager_thread_handle.id()},
-      });
-
-      SIRIUS_LOG_DEBUG(
-        "GPU Pipeline Executor: requested reservation size {} but only got {} bytes, reservation "
-        "shortfall {} bytes for pipeline {} "
-        "task {}, requesting predicate-based downgrade",
-        bytes_needs,
-        partial_size,
-        shortfall,
-        gpu_task->get_pipeline_id(),
-        gpu_task->get_task_id());
-
-      // Reported before the (blocking) downgrade rather than after: the value of
-      // knowing is that the GPU is about to stall, and a listener told only once
-      // it has finished learns nothing it can act on.
-      auto const* downgrade_pipe     = gpu_task->get_pipeline();
-      auto const stalled_operator_id = downgrade_pipe != nullptr
-                                         ? downgrade_pipe->get_source_operator().first
-                                         : op::sirius_physical_operator::invalid_operator_id;
-      _query_event_publisher->publish_memory_downgrade_for_task(
-        make_query_id(
-          static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
-        stalled_operator_id,
-        _memory_space != nullptr ? _memory_space->get_device_id() : -1,
-        shortfall);
-
-      reservation.reset();  // release partial reservation before downgrade
-
-      std::unique_ptr<cucascade::memory::reservation> new_reservation;
-      auto* mem_space = _memory_space;
-      size_t freed    = 0;
-      std::mutex reservation_mutex;
-      try {
-        freed =
-          _downgrade_executor
-            ->request_downgrade([mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
-              std::lock_guard<std::mutex> lock(reservation_mutex);
-              if (new_reservation) { return true; }
-              auto res = mem_space->make_reservation_or_null(bytes_needs);
-              if (res && res->size() >= bytes_needs) { new_reservation = std::move(res); }
-              return new_reservation != nullptr;
-            })
-            .get();
-      } catch (const std::exception& e) {
-        // The downgrade executor cancelled this request (its queue was drained). This task cannot
-        // get its reservation, so fail its query
-        SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
-                        gpu_task->get_task_id(),
-                        e.what());
-        if (iteration_completion) {
-          iteration_completion->report_error(
-            "GPU Pipeline Executor: downgrade request cancelled for task " +
-            std::to_string(gpu_task->get_task_id()) + ": " + e.what());
-        }
-        return;
-      }
-
-      if (new_reservation) {
-        reservation = std::move(new_reservation);
-      } else {
-        // Predicate never succeeded — try one final reservation attempt
-        reservation = _memory_space->make_reservation(bytes_needs);
-      }
-
-      // One INFO line per executor-driven (reserve-path) downgrade. The shortfall
-      // detail above is DEBUG, and the downgrade executor's own per-request line is
-      // DEBUG too, so without this a normal run cannot tell whether its spilling came
-      // from here or from the periodic monitor. Tagged to pair with the
-      // "[downgrade][monitor]" lines in downgrade_executor::monitor_loop.
-      SIRIUS_LOG_INFO(
-        "[downgrade][reserve] pipeline {} task {}: needed {} bytes (shortfall {}), downgrade freed "
-        "{} bytes, reservation {}",
-        gpu_task->get_pipeline_id(),
-        gpu_task->get_task_id(),
-        bytes_needs,
-        shortfall,
-        freed,
-        reservation ? (reservation->size() >= bytes_needs ? "satisfied" : "partial") : "failed");
-
-      if (!reservation) {
-        SIRIUS_LOG_ERROR(
-          "GPU Pipeline Executor: Failed to acquire memory reservation after "
-          "downgrade for task {} (freed {} bytes)",
-          gpu_task->get_task_id(),
-          freed);
-        if (auto handler = gpu_task->get_completion_handler()) {
-          handler->report_error(
-            "GPU Pipeline Executor: Failed to acquire memory reservation "
-            "after downgrade for task " +
-            std::to_string(gpu_task->get_task_id()));
-        }
-        return;
-      }
-      if (reservation->size() < bytes_needs) {
-        SIRIUS_LOG_WARN(
-          "GPU Pipeline Executor: after downgrade ({} bytes freed), reservation "
-          "still partial ({}/{} bytes) for pipeline {} task {} -- proceeding "
-          "with partial reservation",
-          freed,
-          reservation->size(),
-          bytes_needs,
-          gpu_task->get_pipeline_id(),
-          gpu_task->get_task_id());
-      }
-    } else if (reservation->size() < bytes_needs) {
-      // No downgrade executor available -- warn and proceed (this should never happen)
-      SIRIUS_LOG_WARN(
-        "GPU Pipeline Executor: Acquired memory reservation does not match "
-        "requested size for pipeline {} of {} bytes needed for task "
-        "{}. Reservation size: {}. WARNING: Downgrade executor is not available",
-        gpu_task->get_pipeline_id(),
-        bytes_needs,
-        gpu_task->get_task_id(),
-        reservation->size());
     }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {

@@ -1,5 +1,9 @@
 # Memory Management
 
+> On `experiment/uvm-alloc`, GPU allocation and spilling follow the
+> [UVM experiment](uvm-experiment.md). The tiering description below documents
+> the upstream engine behavior.
+
 This document covers the memory tier hierarchy, reservation system, downgrade executor, and pinned host memory management.
 
 ## Memory Tier Hierarchy

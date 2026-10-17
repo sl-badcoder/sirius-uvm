@@ -206,6 +206,29 @@ class failing_gpu_task : public sirius_pipeline_task {
   bool nonstandard_exception_;
 };
 
+class budget_gpu_task : public sirius_pipeline_task {
+ public:
+  budget_gpu_task(std::shared_ptr<test_gpu_pipeline_task_global_state> global, std::size_t bytes)
+    : sirius_pipeline_task(
+        1, std::make_unique<test_gpu_pipeline_task_local_state>(nullptr), global),
+      global_(std::move(global)),
+      bytes_(bytes)
+  {
+  }
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space*) const override
+  {
+    sirius::pipeline::reservation_size_info info;
+    info.reservation_size = bytes_;
+    return info;
+  }
+  void execute(::cuda::stream_ref) override { global_->executed_count.fetch_add(1); }
+
+ private:
+  std::shared_ptr<test_gpu_pipeline_task_global_state> global_;
+  std::size_t bytes_;
+};
+
 // Hold the production manager before it can pop any staging task. The gate is test-local;
 // no production callback or alternative manager protocol is needed to control the interleaving.
 class paused_gpu_executor : public sirius::pipeline::gpu_pipeline_executor {
@@ -552,4 +575,48 @@ TEST_CASE("bounded pool survives a throwing error sink and releases its slot",
   pool.dispatch(pool.reserve(), [&] { ran = true; });
   pool.wait_all();
   CHECK(ran);
+}
+
+TEST_CASE("UVM pipeline reservation failures terminate without executing or spilling",
+          "[uvm][gpu_pipeline_executor]")
+{
+  using namespace std::chrono_literals;
+  constexpr std::size_t budget = 64ULL << 20;
+  cucascade::memory::gpu_memory_space_config gpu;
+  gpu.device_id                  = 0;
+  gpu.memory_capacity            = budget;
+  gpu.reservation_limit_fraction = 1.0;
+  sirius::memory::sirius_memory_reservation_manager manager({gpu});
+  auto* space = manager.get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+  std::size_t requested = budget + 1;
+  std::unique_ptr<cucascade::memory::reservation> held;
+  SECTION("request exceeds the entire budget") {}
+  SECTION("other live reservations consume the budget")
+  {
+    held = space->make_reservation_or_null(budget);
+    REQUIRE(held);
+    requested = 4096;
+  }
+  auto completion = std::make_shared<sirius::pipeline::completion_handler>();
+  auto done       = completion->get_awaitable();
+  auto global     = std::make_shared<test_gpu_pipeline_task_global_state>();
+  global->set_completion_handler(completion);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> requests;
+  sirius::pipeline::gpu_pipeline_executor executor(lifecycle,
+                                                   {1, "uvm-budget-test"},
+                                                   space,
+                                                   requests.make_publisher(),
+                                                   nullptr,
+                                                   sirius::test::make_test_telemetry_context());
+  executor.start();
+  REQUIRE(executor.schedule(std::make_unique<budget_gpu_task>(global, requested)));
+  REQUIRE(done.wait_for(5s) == std::future_status::ready);
+  REQUIRE_THROWS_WITH(
+    done.get(),
+    Catch::Matchers::ContainsSubstring("UVM: logical GPU reservation budget exhausted"));
+  executor.stop();
+  CHECK(global->executed_count.load() == 0);
 }

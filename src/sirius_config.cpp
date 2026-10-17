@@ -929,23 +929,39 @@ try {
       const auto& gpu_ids = std::get<std::vector<int>>(topo.num_gpus_or_gpu_ids);
       builder.set_gpu_ids(gpu_ids);
     }
-    gpu_cfg.setup_configurator(builder);
+    // cuCascade's builder caps byte budgets at physical VRAM. Build the
+    // topology with a fraction, then apply the UVM logical byte budget below.
+    auto physical_cfg = gpu_cfg;
+    if (std::holds_alternative<std::uint64_t>(physical_cfg.usage_limit)) {
+      physical_cfg.usage_limit = 1.0;
+    }
+    physical_cfg.reservation_limit = 1.0;
+    physical_cfg.setup_configurator(builder);
     host_cfg.setup_configurator(builder);
     disk_cfg.setup_configurator(builder);
-    if (auto bytes = std::get_if<std::uint64_t>(&gpu_cfg.usage_limit)) {
-      // Resolve selected devices through the same configurator before its byte-limit assertion.
-      auto capacity_builder = builder;
-      capacity_builder.set_usage_limit_ratio_per_gpu(1.0);
-      for (auto const& space : capacity_builder.build(hw_topology)) {
-        if (auto gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
-            gpu && *bytes > gpu->memory_capacity) {
+    settings._memory_space_configs = builder.build(hw_topology);
+    for (auto& space : settings._memory_space_configs) {
+      auto* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+      if (!gpu) { continue; }
+      if (auto bytes = std::get_if<std::uint64_t>(&gpu_cfg.usage_limit)) {
+        if (*bytes > (std::uint64_t{1} << 62)) {
           throw configuration_input_error(
-            "sirius.memory.gpu.usage_limit_bytes exceeds the capacity of GPU " +
-            std::to_string(gpu->device_id));
+            "sirius.memory.gpu.usage_limit_bytes exceeds the supported UVM accounting range");
         }
+        gpu->memory_capacity = *bytes;
+      }
+      if (auto fraction = std::get_if<double>(&gpu_cfg.reservation_limit)) {
+        gpu->reservation_limit_fraction = *fraction;
+      } else {
+        auto const bytes = std::get<std::uint64_t>(gpu_cfg.reservation_limit);
+        if (bytes > gpu->memory_capacity) {
+          throw configuration_input_error(
+            "sirius.memory.gpu.reservation_limit_bytes exceeds the logical UVM budget");
+        }
+        gpu->reservation_limit_fraction =
+          gpu->memory_capacity == 0 ? 0.0 : static_cast<double>(bytes) / gpu->memory_capacity;
       }
     }
-    settings._memory_space_configs = builder.build(hw_topology);
   }
 
   const auto defaults =

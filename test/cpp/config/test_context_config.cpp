@@ -190,6 +190,21 @@ TEST_CASE("configuration resolver applies YAML GPU limits", "[context_config][co
                         Catch::Matchers::ContainsSubstring("capacity.yaml") &&
                           Catch::Matchers::ContainsSubstring("usage_limit_bytes exceeds"));
   }
+  SECTION("UVM byte budget may exceed physical VRAM")
+  {
+    auto physical =
+      sirius::parsed_sirius_config::from_node(
+        YAML::Load("sirius: {topology: {num_gpus: 1}, memory: {gpu: {usage_limit_fraction: 1.0}}}"))
+        .resolve(topology);
+    auto const logical = gpu_space(physical).memory_capacity * 2;
+    REQUIRE(logical > gpu_space(physical).memory_capacity);
+    auto root = YAML::Load("sirius: {topology: {num_gpus: 1}}");
+    root["sirius"]["memory"]["gpu"]["usage_limit_bytes"]       = logical;
+    root["sirius"]["memory"]["gpu"]["reservation_limit_bytes"] = logical / 2;
+    auto resolved = sirius::parsed_sirius_config::from_node(root).resolve(topology);
+    CHECK(gpu_space(resolved).memory_capacity == logical);
+    CHECK(gpu_space(resolved).reservation_limit() == logical / 2);
+  }
   SECTION("fraction limits use physical capacity")
   {
     auto physical =

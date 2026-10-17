@@ -30,11 +30,25 @@
 #include <chrono>
 #include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
 namespace sirius {
 namespace parallel {
+
+namespace {
+
+std::future<size_t> uvm_spill_disabled()
+{
+  std::promise<size_t> result;
+  auto future = result.get_future();
+  result.set_exception(std::make_exception_ptr(
+    std::runtime_error("UVM: application GPU spilling is disabled; NVIDIA UVM owns residency")));
+  return future;
+}
+
+}  // namespace
 
 static std::string tier_to_string(cucascade::memory::Tier tier)
 {
@@ -110,7 +124,8 @@ void downgrade_executor::start()
 
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 
-  if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
+  if (_space_id.tier != cucascade::memory::Tier::GPU && _memory_space &&
+      _config.monitor_period > std::chrono::milliseconds::zero()) {
     _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
   }
 }
@@ -657,6 +672,7 @@ void downgrade_executor::set_pipeline_task_queue(
 
 std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
 {
+  if (_space_id.tier == cucascade::memory::Tier::GPU) { return uvm_spill_disabled(); }
   auto req          = std::make_unique<downgrade_request>();
   req->target_bytes = bytes;
   req->predicate    = [&freed = req->bytes_freed, bytes]() {
@@ -677,6 +693,7 @@ size_t downgrade_executor::request_free_memory_and_wait(size_t bytes)
 
 std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> predicate)
 {
+  if (_space_id.tier == cucascade::memory::Tier::GPU) { return uvm_spill_disabled(); }
   auto req       = std::make_unique<downgrade_request>();
   req->predicate = std::move(predicate);
   auto future    = req->result.get_future();

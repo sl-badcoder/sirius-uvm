@@ -1695,7 +1695,7 @@ bool duckdb_fallback_enabled(ClientContext& context)
   if (context.TryGetCurrentSetting("enable_duckdb_fallback", setting) && !setting.IsNull()) {
     return setting.GetValue<bool>();
   }
-  return true;
+  return false;
 }
 
 bool like_swar_fastpath_enabled(ClientContext& context)

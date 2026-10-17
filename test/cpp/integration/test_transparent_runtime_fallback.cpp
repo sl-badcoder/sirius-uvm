@@ -526,23 +526,25 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
   sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0, 0);
 }
 
-// The enable_duckdb_fallback setting defaults to true and is overridable per session.
+// The UVM experiment defaults fallback to false; it remains overridable per session.
 TEST_CASE_METHOD(RuntimeFallbackFixture,
-                 "runtime fallback: setting defaults true and is session-overridable",
+                 "runtime fallback: setting defaults false and is session-overridable",
                  "[transparent][fallback][integration]")
 {
+  // The fixture explicitly enables fallback; inspect a fresh session instead.
+  auto connection = make_connection();
   duckdb::Value v;
-  auto lr = con->context->TryGetCurrentSetting("enable_duckdb_fallback", v);
+  auto lr = connection->context->TryGetCurrentSetting("enable_duckdb_fallback", v);
   REQUIRE(lr.GetScope() != duckdb::SettingScope::INVALID);
   REQUIRE_FALSE(v.IsNull());
-  REQUIRE(v.GetValue<bool>() == true);
-
-  con->Query("SET enable_duckdb_fallback = false;");
-  con->context->TryGetCurrentSetting("enable_duckdb_fallback", v);
   REQUIRE(v.GetValue<bool>() == false);
 
-  con->Query("SET enable_duckdb_fallback = true;");
-  con->context->TryGetCurrentSetting("enable_duckdb_fallback", v);
+  connection->Query("SET enable_duckdb_fallback = false;");
+  connection->context->TryGetCurrentSetting("enable_duckdb_fallback", v);
+  REQUIRE(v.GetValue<bool>() == false);
+
+  connection->Query("SET enable_duckdb_fallback = true;");
+  connection->context->TryGetCurrentSetting("enable_duckdb_fallback", v);
   REQUIRE(v.GetValue<bool>() == true);
 }
 

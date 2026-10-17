@@ -2983,16 +2983,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     Value(std::string(sirius::strategy_to_string(operator_defaults.expression_strategy))),
     SetExpressionExecutorStrategyDeprecated);
 
-  add_sirius_option(
-    config,
-    option_visibility::user,
-    "enable_duckdb_fallback",
-    "Whether to enable fallback to duckdb execution after an error is detected",
-    LogicalType::BOOLEAN,
-    Value::BOOLEAN(true),  // literal default: never seed from a process-global that a
-                           // prior connection's SET may have mutated (that leaked the
-                           // fallback policy into every freshly-created database).
-    SetEnableDuckdbFallback);
+  add_sirius_option(config,
+                    option_visibility::user,
+                    "enable_duckdb_fallback",
+                    "Whether to enable fallback to duckdb execution after an error is detected",
+                    LogicalType::BOOLEAN,
+                    // Failed GPU execution must not silently become a CPU benchmark.
+                    Value::BOOLEAN(false),
+                    SetEnableDuckdbFallback);
 
   add_sirius_option(config,
                     option_visibility::internal,

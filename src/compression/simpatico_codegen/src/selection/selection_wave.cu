@@ -335,7 +335,7 @@ int64_t count_touched_chunks(uint32_t const* chunk_offsets, int64_t num_chunks)
 {
   if (chunk_offsets == nullptr || num_chunks <= 0) { return -1; }
   int32_t* counter = nullptr;
-  if (cudaMalloc(&counter, sizeof(int32_t)) != cudaSuccess) { return -1; }
+  if (cudaMallocManaged(&counter, sizeof(int32_t)) != cudaSuccess) { return -1; }
   int64_t touched = -1;
   if (cudaMemset(counter, 0, sizeof(int32_t)) == cudaSuccess) {
     count_touched_kernel<<<grid_for(num_chunks, kBlock), kBlock>>>(

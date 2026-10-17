@@ -169,7 +169,6 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   cucascade::memory::exclusive_stream_pool _stream_pool;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
-  sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   /// Observer of query event transitions.  Never null; see task_creator.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
