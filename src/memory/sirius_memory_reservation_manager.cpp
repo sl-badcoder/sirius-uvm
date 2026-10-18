@@ -19,11 +19,11 @@
 
 #include "cucascade/memory/common.hpp"
 #include "log/logging.hpp"
+#include "memory/managed_pool_memory_resource.hpp"
 
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/mr/managed_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -53,7 +53,7 @@ auto managed_configs(std::vector<cucascade::memory::memory_space_config> configs
         gpu->reservation_limit_fraction < 0 || gpu->reservation_limit_fraction > 1) {
       throw std::invalid_argument("UVM: invalid logical GPU memory budget");
     }
-    gpu->mr_factory_fn = [](int device_id, std::size_t) {
+    gpu->mr_factory_fn = [](int device_id, std::size_t capacity) {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       int managed    = 0;
       int concurrent = 0;
@@ -64,9 +64,18 @@ auto managed_configs(std::vector<cucascade::memory::memory_space_config> configs
         throw std::runtime_error(
           "UVM experiment requires managed memory and concurrent managed access on every GPU");
       }
-      // No pool, prefetch, preferred-location advice, or device-memory fallback.
+      // The pool owns its managed upstream and reuses stream-ordered blocks.
+      // Bound backing storage as well as live/reserved bytes. RMM requires a
+      // 256-byte-aligned maximum; the unused tail remains outside the pool.
+      auto const maximum = capacity - capacity % rmm::CUDA_ALLOCATION_ALIGNMENT;
+      if (maximum == 0) {
+        throw std::invalid_argument("UVM managed pool requires a budget of at least 256 bytes");
+      }
+      // Start empty. RMM's capped-pool growth policy may reserve a large first
+      // backing block; allocation does not prefetch or establish VRAM residency.
+      // No memory advice, prefetch, or fallback to device allocations.
       return ::cuda::mr::any_resource<::cuda::mr::device_accessible>{
-        rmm::mr::managed_memory_resource{}};
+        managed_pool_memory_resource{device_id, maximum}};
     };
   }
   return configs;
@@ -84,7 +93,8 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
   }
   for (const auto* space : gpu_spaces) {
     SIRIUS_LOG_INFO(
-      "UVM experiment: GPU {} uses cudaMallocManaged; logical reservation limit {} bytes; "
+      "UVM experiment: GPU {} uses an RMM pool backed by cudaMallocManaged; "
+      "logical reservation limit {} bytes; "
       "application GPU spilling disabled",
       space->get_device_id(),
       space->get_max_memory());

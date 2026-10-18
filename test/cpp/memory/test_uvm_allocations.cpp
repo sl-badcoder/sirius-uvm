@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "memory/managed_pool_memory_resource.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -25,14 +26,19 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/managed_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/config.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -77,6 +83,17 @@ TEST_CASE("Sirius GPU buffers and cuDF defaults use managed allocations", "[uvm]
     sirius::memory::sirius_memory_reservation_manager manager({gpu_config(device)});
     auto* space = manager.get_memory_space(cucascade::memory::Tier::GPU, device);
     REQUIRE(space != nullptr);
+    auto* adaptor =
+      space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    REQUIRE(adaptor != nullptr);
+    auto upstream = adaptor->get_upstream_resource();
+    auto* managed_pool =
+      cuda::mr::resource_cast<sirius::memory::managed_pool_memory_resource>(&upstream);
+    REQUIRE(managed_pool != nullptr);
+    auto const* pool = &managed_pool->pool();
+    auto backing     = pool->get_upstream_resource();
+    REQUIRE(cuda::mr::resource_cast<rmm::mr::managed_memory_resource>(&backing) != nullptr);
+    CHECK(pool->pool_size() == 0);
     rmm::cuda_stream stream;
     {
       rmm::device_buffer explicit_buffer(4096, stream, space->get_default_allocator());
@@ -96,11 +113,106 @@ TEST_CASE("Sirius GPU buffers and cuDF defaults use managed allocations", "[uvm]
       }
     }
     stream.synchronize();
+    auto const backing_size = pool->pool_size();
+    REQUIRE(backing_size >= 4096);
+    CHECK(backing_size <= budget);
+    // A freed block can be reused without growing backing storage. Also test a
+    // different stream: the RMM pool must preserve ordering across the handoff.
+    rmm::cuda_stream other_stream;
+    {
+      rmm::device_buffer reused(4096, other_stream, space->get_default_allocator());
+      require_managed(reused.data());
+      REQUIRE(cudaMemsetAsync(reused.data(), 0x3c, 4096, other_stream.value()) == cudaSuccess);
+      other_stream.synchronize();
+      auto const* bytes = static_cast<unsigned char const*>(reused.data());
+      for (std::size_t i = 0; i < 4096; ++i) {
+        REQUIRE(bytes[i] == 0x3c);
+      }
+      CHECK(pool->pool_size() == backing_size);
+    }
+    other_stream.synchronize();
     // A real logical cap remains in force; UVM is not an unlimited fake budget.
     REQUIRE_THROWS(rmm::device_buffer(budget + 1, stream, space->get_default_allocator()));
     REQUIRE(space->make_reservation_or_null(budget) != nullptr);
     REQUIRE(space->make_reservation_or_null(budget + 1) == nullptr);
   }
+}
+
+TEST_CASE("Managed pool rounds its backing limit down to allocation alignment", "[uvm]")
+{
+  auto config            = gpu_config(0);
+  config.memory_capacity = budget + 1;
+  sirius::memory::sirius_memory_reservation_manager manager({config});
+  auto* space = manager.get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  rmm::cuda_stream stream;
+  rmm::device_buffer full(budget, stream, space->get_default_allocator());
+  require_managed(full.data());
+  stream.synchronize();
+  // The logical budget includes the one-byte tail, but it cannot create another
+  // aligned block or bypass the managed pool's finite backing limit.
+  REQUIRE_THROWS(rmm::device_buffer(1, stream, space->get_default_allocator()));
+}
+
+TEST_CASE("Managed pool orders reused backing across streams", "[uvm]")
+{
+  sirius::memory::sirius_memory_reservation_manager manager({gpu_config(0)});
+  auto* space = manager.get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  rmm::cuda_stream producer;
+  rmm::cuda_stream consumer;
+  void* address = nullptr;
+  {
+    // Fill the entire pool, so the next allocation must reuse this backing.
+    rmm::device_buffer first(budget, producer, space->get_default_allocator());
+    address = first.data();
+    REQUIRE(cudaMemsetAsync(first.data(), 0x6d, budget, producer.value()) == cudaSuccess);
+    // Deliberately do not synchronize the producer before returning its block.
+  }
+  rmm::device_buffer reused(budget, consumer, space->get_default_allocator());
+  REQUIRE(reused.data() == address);
+  require_managed(reused.data());
+  // The pool must order the producer's writes before this consumer's read.
+  // Host destination remains alive until the consumer completes.
+  std::vector<unsigned char> bytes(budget);
+  REQUIRE(cudaMemcpyAsync(
+            bytes.data(), reused.data(), budget, cudaMemcpyDeviceToHost, consumer.value()) ==
+          cudaSuccess);
+  consumer.synchronize();
+  REQUIRE(std::all_of(bytes.begin(), bytes.end(), [](auto byte) { return byte == 0x6d; }));
+}
+
+TEST_CASE("Managed pools tear down on their owning GPUs", "[uvm][multi_gpu]")
+{
+  int count = 0;
+  REQUIRE(cudaGetDeviceCount(&count) == cudaSuccess);
+  if (count < 2) {
+    WARN("Managed pool multi-GPU teardown requires two visible GPUs");
+    return;
+  }
+  rmm::cuda_set_device_raii caller_device{rmm::cuda_device_id{1}};
+  auto manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+    std::vector<cucascade::memory::memory_space_config>{gpu_config(0), gpu_config(1)});
+  for (int device = 0; device < 2; ++device) {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    auto* space = manager->get_memory_space(cucascade::memory::Tier::GPU, device);
+    REQUIRE(space != nullptr);
+    rmm::cuda_stream stream;
+    {
+      rmm::device_buffer buffer(4096, stream, space->get_default_allocator());
+      require_managed(buffer.data());
+      REQUIRE(cudaMemsetAsync(buffer.data(), 0, 4096, stream.value()) == cudaSuccess);
+      stream.synchronize();
+    }
+    stream.synchronize();
+  }
+  // Both pools retain backing. Device 1 is current when device 0's pool is
+  // destroyed; the owning adapter must switch devices and restore the caller.
+  manager.reset();
+  int current = -1;
+  REQUIRE(cudaGetDevice(&current) == cudaSuccess);
+  CHECK(current == 1);
+  CHECK(cudaGetLastError() == cudaSuccess);
 }
 
 TEST_CASE("UVM rejects GPU application spill requests without starting workers", "[uvm]")
